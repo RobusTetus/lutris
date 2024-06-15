@@ -1,4 +1,5 @@
 """Widget generators and their signal handlers"""
+
 # Standard Library
 # pylint: disable=no-member,too-many-public-methods
 import os
@@ -496,7 +497,6 @@ class ConfigBox(VBox):
             default_path=chooser_default_path,
             shell_quoting=shell_quoting,
         )
-        # file_chooser.set_size_request(200, 30)
 
         if "default_path" in option:
             chooser_default_path = self.lutris_config.system_config.get(option["default_path"])

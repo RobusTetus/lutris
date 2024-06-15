@@ -1,16 +1,18 @@
 """Runtime handling module"""
+
 import concurrent.futures
 import os
 import threading
 import time
 from gettext import gettext as _
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from lutris import settings
 from lutris.api import (
     check_stale_runtime_versions,
     download_runtime_versions,
     format_runner_version,
+    get_runtime_versions,
     get_time_from_api_date,
 )
 from lutris.gui.widgets.progress_box import ProgressInfo
@@ -21,6 +23,7 @@ from lutris.util.extract import extract_archive
 from lutris.util.jobs import AsyncCall
 from lutris.util.linux import LINUX_SYSTEM
 from lutris.util.log import logger
+from lutris.util.strings import parse_version
 from lutris.util.wine.d3d_extras import D3DExtrasManager
 from lutris.util.wine.dgvoodoo2 import dgvoodoo2Manager
 from lutris.util.wine.dxvk import DXVKManager
@@ -171,6 +174,11 @@ class RuntimeUpdater:
                 self.update_runtime = False
                 self.update_runners = False
 
+        if self.has_updates:
+            self.runtime_versions = download_runtime_versions()
+        else:
+            self.runtime_versions = get_runtime_versions()
+
     @property
     def has_updates(self):
         return self.update_runtime or self.update_runners
@@ -183,19 +191,36 @@ class RuntimeUpdater:
 
         This method also downloads fresh runner versions on each call, so we call this on a
         worker thread, instead of blocking the UI."""
-        if not self.has_updates:
+        if not self.runtime_versions:
             return []
 
-        runtime_versions = download_runtime_versions()
         updaters: List[ComponentUpdater] = []
 
         if self.update_runtime:
-            updaters += self._get_runtime_updaters(runtime_versions)
+            updaters += self._get_runtime_updaters(self.runtime_versions)
 
         if self.update_runners:
-            updaters += self._get_runner_updaters(runtime_versions)
+            updaters += self._get_runner_updaters(self.runtime_versions)
 
         return [u for u in updaters if u.should_update]
+
+    def check_client_versions(self) -> Optional[str]:
+        """Checks if the client is of an old version and no longer supported; this can be blocked
+        with an env-var, and can be temporarily ignored as well, but if we're out of date, then
+        this method returns the version of Lutris that is required. If we're good, or we are ignoring
+        the problem, this returns None.
+
+        I expect that most users will not discover the env-var, so they will be prompted
+        on each new Lutris release."""
+        if self.runtime_versions and not os.environ.get("LUTRIS_NO_CLIENT_VERSION_CHECK"):
+            client_version = self.runtime_versions.get("client_version")
+            if client_version:
+                if parse_version(client_version) > parse_version(settings.VERSION):
+                    ignored = settings.read_setting("ignored_supported_lutris_verison")
+                    if not ignored or ignored != client_version:
+                        return client_version
+
+        return None
 
     @staticmethod
     def _get_runtime_updaters(runtime_versions: Dict[str, Any]) -> List[ComponentUpdater]:
@@ -221,13 +246,13 @@ class RuntimeUpdater:
         """Update installed runners (only works for Wine at the moment)"""
         updaters: List[ComponentUpdater] = []
         upstream_runners = runtime_versions.get("runners", {})
-        for name, upstream_runners in upstream_runners.items():
+        for name, runner_set in upstream_runners.items():
             if name != "wine":
                 continue
             upstream_runner = None
-            for _runner in upstream_runners:
-                if _runner["architecture"] == LINUX_SYSTEM.arch:
-                    upstream_runner = _runner
+            for runner in runner_set:
+                if runner["architecture"] == LINUX_SYSTEM.arch:
+                    upstream_runner = runner
 
             if upstream_runner:
                 updaters.append(RunnerComponentUpdater(name, upstream_runner))
@@ -465,13 +490,7 @@ class RunnerComponentUpdater(ComponentUpdater):
     def should_update(self):
         # This has the responsibility to update existing runners, not installing new ones
         runner_base_path = os.path.join(settings.RUNNER_DIR, self.name)
-        if not system.path_exists(runner_base_path) or not os.listdir(runner_base_path):
-            return False
-
-        if system.path_exists(self.version_path):
-            return False
-
-        return True
+        return system.path_exists(runner_base_path) and not system.path_exists(self.version_path)
 
     def install_update(self, updater: "RuntimeUpdater") -> None:
         url = self.upstream_runner["url"]

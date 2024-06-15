@@ -1,10 +1,12 @@
 """Generic service utilities"""
+
 import os
 import shutil
 from gettext import gettext as _
+from pathlib import Path
 from typing import List
 
-from gi.repository import Gio, GObject
+from gi.repository import Gio
 
 from lutris import api, settings
 from lutris.api import get_game_installers
@@ -12,10 +14,11 @@ from lutris.config import write_game_config
 from lutris.database import sql
 from lutris.database.games import add_game, get_game_by_field, get_game_for_service, get_games
 from lutris.database.services import ServiceGameCollection
-from lutris.game import Game
+from lutris.game import GAME_UPDATED, Game
 from lutris.gui.dialogs import NoticeDialog
 from lutris.gui.dialogs.webconnect_dialog import DEFAULT_USER_AGENT, WebConnectDialog
 from lutris.gui.views.media_loader import download_media
+from lutris.gui.widgets import NotificationSource
 from lutris.gui.widgets.utils import BANNER_SIZE, ICON_SIZE
 from lutris.services.service_media import ServiceMedia
 from lutris.util import system
@@ -68,7 +71,13 @@ class LutrisCoverartMedium(LutrisCoverart):
     size = (176, 234)
 
 
-class BaseService(GObject.Object):
+SERVICE_GAMES_LOADING = NotificationSource()
+SERVICE_GAMES_LOADED = NotificationSource()
+SERVICE_LOGIN = NotificationSource()
+SERVICE_LOGOUT = NotificationSource()
+
+
+class BaseService:
     """Base class for local services"""
 
     id = NotImplemented
@@ -86,13 +95,6 @@ class BaseService(GObject.Object):
     extra_medias = {}
     default_format = "icon"
     is_loading = False
-
-    __gsignals__ = {
-        "service-games-load": (GObject.SIGNAL_RUN_FIRST, None, ()),
-        "service-games-loaded": (GObject.SIGNAL_RUN_FIRST, None, ()),
-        "service-login": (GObject.SIGNAL_RUN_FIRST, None, ()),
-        "service-logout": (GObject.SIGNAL_RUN_FIRST, None, ()),
-    }
 
     @property
     def matcher(self):
@@ -145,10 +147,10 @@ class BaseService(GObject.Object):
                 self.is_loading = False
 
         def reload_cb(_result, error):
-            self.emit("service-games-loaded")
+            SERVICE_GAMES_LOADED.fire(self)
             reloaded_callback(error)
 
-        self.emit("service-games-load")
+        SERVICE_GAMES_LOADING.fire(self)
         AsyncCall(do_reload, reload_cb)
 
     def load(self):
@@ -342,7 +344,7 @@ class BaseService(GObject.Object):
         # If an existing game was found, it may have been updated,
         # and it's not safe to fire this until we get here.
         if existing_game:
-            existing_game.emit("game-updated")
+            GAME_UPDATED.fire(existing_game)
 
         if service_installers and db_game:
             application = Gio.Application.get_default()
@@ -405,6 +407,7 @@ class OnlineService(BaseService):
     cache_path = NotImplemented
     requires_login_page = False
 
+    login_url = NotImplemented
     login_window_width = 390
     login_window_height = 500
     login_user_agent = DEFAULT_USER_AGENT
@@ -430,9 +433,31 @@ class OnlineService(BaseService):
         dialog = WebConnectDialog(self, parent)
         dialog.run()
 
+    @property
+    def is_login_in_progress(self) -> bool:
+        """Set to true if the login process is underway; the credential files make be created at this
+        time, but that does not count as 'authenticated' until the login process is over. This is used
+        by WebConnectDialog since it creates its cookies before the login is actually complete.
+
+        This is recorded with a file in ~/.cache/lutris so it will persist across Lutris
+        restarted, just as the credentials themselves do. For this reason, we need to allow
+        the user to login again even when a login is in progress."""
+        return self._get_login_in_progress_path().exists()
+
+    @is_login_in_progress.setter
+    def is_login_in_progress(self, in_progress: bool) -> None:
+        path = self._get_login_in_progress_path()
+        if in_progress:
+            path.touch()
+        else:
+            path.unlink(missing_ok=True)
+
+    def _get_login_in_progress_path(self) -> Path:
+        return Path(os.path.join(settings.CACHE_DIR, f"{self.name}-login-in-progress"))
+
     def is_authenticated(self):
         """Return whether the service is authenticated"""
-        return all(system.path_exists(path) for path in self.credential_files)
+        return not self.is_login_in_progress and all(system.path_exists(path) for path in self.credential_files)
 
     def wipe_game_cache(self):
         """Wipe the game cache, allowing it to be reloaded"""
@@ -453,7 +478,7 @@ class OnlineService(BaseService):
             except OSError:
                 logger.warning("Unable to remove %s", auth_file)
         logger.debug("logged out from %s", self.id)
-        self.emit("service-logout")
+        SERVICE_LOGOUT.fire(self)
 
     def load_cookies(self):
         """Load cookies from disk"""

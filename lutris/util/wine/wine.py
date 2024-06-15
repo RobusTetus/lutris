@@ -1,4 +1,5 @@
 """Utilities for manipulating Wine"""
+
 import os
 from collections import OrderedDict
 from gettext import gettext as _
@@ -185,7 +186,7 @@ def get_default_wine_version() -> str:
     installed_versions = get_installed_wine_versions()
     if installed_versions:
         default_version = get_default_wine_runner_version_info()
-        if "version" in default_version and "architecture" in default_version:
+        if default_version and "version" in default_version and "architecture" in default_version:
             version = default_version["version"] + "-" + default_version["architecture"]
             if version in installed_versions:
                 return version

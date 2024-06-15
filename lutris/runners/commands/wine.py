@@ -1,8 +1,10 @@
 """Wine commands for installers"""
+
 # pylint: disable=too-many-arguments
 import os
 import shlex
 import time
+from gettext import gettext as _
 
 from lutris import runtime, settings
 from lutris.monitored_command import MonitoredCommand
@@ -23,6 +25,8 @@ from lutris.util.wine.wine import (
     is_installed_systemwide,
     is_prefix_directory,
 )
+
+GE_PROTON_LATEST = _("GE-Proton (Latest)")
 
 
 def set_regedit(
@@ -149,7 +153,7 @@ def create_prefix(
         system.execute([wineboot_path], env=wineenv)
     else:
         wineenv["GAMEID"] = proton.DEFAULT_GAMEID
-        wineenv["ULWGL_LOG"] = "debug"
+        wineenv["UMU_LOG"] = "debug"
         wineenv["WINEARCH"] = "win64"
         wineenv["PROTONPATH"] = proton.get_proton_path_from_bin(wine_path)
         command = MonitoredCommand([proton.get_umu_path(), "createprefix"], env=wineenv)
@@ -177,11 +181,14 @@ def winekill(prefix, arch=WINE_DEFAULT_ARCH, wine_path=None, env=None, initial_p
     """Kill processes in Wine prefix."""
 
     initial_pids = initial_pids or []
+    steam_data_dir = os.path.expanduser("~/.local/share/Steam/compatibilitytools.d")
     if not env:
         env = {"WINEARCH": arch, "WINEPREFIX": prefix}
-    if proton.is_proton_path(wine_path):
-        command = [proton.get_umu_path(), "runinprefix", "wineboot", "-e"]
+    if wine_path == GE_PROTON_LATEST and os.path.exists(f"{steam_data_dir}/UMU-Latest"):
+        proton_version = os.path.realpath(f"{steam_data_dir}/UMU-Latest")
+        command = [os.path.join(proton_version, "files", "bin", "wineserver"), "-k"]
         env["GAMEID"] = proton.DEFAULT_GAMEID
+        env["WINEPREFIX"] = prefix
     else:
         if not wine_path:
             if not runner:
@@ -332,6 +339,10 @@ def wineexec(
         game = None
         wineenv["GAMEID"] = proton.get_game_id(game)
         wineenv["PROTONPATH"] = proton.get_proton_path_from_bin(wine_path)
+        locale = env.get("LC_ALL")
+        host_locale = env.get("HOST_LC_ALL")
+        if locale and not host_locale:
+            wineenv["HOST_LC_ALL"] = locale
 
     baseenv = runner.get_env(disable_runtime=disable_runtime)
     baseenv.update(wineenv)

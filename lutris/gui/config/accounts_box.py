@@ -7,12 +7,14 @@ from lutris.api import disconnect, read_user_info
 from lutris.gui.config.base_config_box import BaseConfigBox
 from lutris.gui.config.updates_box import UpdateButtonBox
 from lutris.gui.dialogs import ClientLoginDialog, QuestionDialog
+from lutris.gui.widgets import EMPTY_NOTIFICATION_REGISTRATION
+from lutris.services.lutris import sync_media
 from lutris.util.jobs import AsyncCall
 from lutris.util.library_sync import (
     LOCAL_LIBRARY_SYNCED,
     LOCAL_LIBRARY_SYNCING,
-    get_is_local_library_syncing,
-    sync_local_library,
+    LibrarySyncer,
+    is_local_library_syncing,
 )
 from lutris.util.steam.config import STEAM_ACCOUNT_SETTING, get_steam_users
 from lutris.util.strings import time_ago
@@ -31,8 +33,8 @@ class AccountsBox(BaseConfigBox):
         self.bullshit_box.add(self.lutris_options)
         frame.add(self.bullshit_box)
 
-        self.library_syncing_source_id = None
-        self.library_synced_source_id = None
+        self.library_syncing_registration = EMPTY_NOTIFICATION_REGISTRATION
+        self.library_synced_registration = EMPTY_NOTIFICATION_REGISTRATION
 
         self.sync_box = UpdateButtonBox(self.get_sync_box_label(), _("Sync Again"), clicked=self.on_sync_again_clicked)
 
@@ -58,17 +60,16 @@ class AccountsBox(BaseConfigBox):
         self.frame.add(self.accounts_box)
 
     def on_realize(self, _widget):
-        self.library_syncing_source_id = LOCAL_LIBRARY_SYNCING.register(self.on_local_library_syncing)
-        self.library_synced_source_id = LOCAL_LIBRARY_SYNCED.register(self.on_local_library_synced)
-
-        if get_is_local_library_syncing():
+        self.library_syncing_registration = LOCAL_LIBRARY_SYNCING.register(self.on_local_library_syncing)
+        self.library_synced_registration = LOCAL_LIBRARY_SYNCED.register(self.on_local_library_synced)
+        if is_local_library_syncing():
             self.on_local_library_syncing()
 
-    def on_unrealize(self, _widget):
+    def on_unrealize(self, _widget) -> None:
         # The destroy signal never fires for this sub-widget, so we use
         # realize/unrealize for this instead.
-        LOCAL_LIBRARY_SYNCING.unregister(self.library_syncing_source_id)
-        LOCAL_LIBRARY_SYNCED.unregister(self.library_synced_source_id)
+        self.library_syncing_registration.unregister()
+        self.library_synced_registration.unregister()
 
     def space_widget(self, widget, top=16, bottom=16):
         widget.set_margin_top(top)
@@ -173,13 +174,14 @@ class AccountsBox(BaseConfigBox):
         self.rebuild_lutris_options()
 
     def on_sync_again_clicked(self, _button):
-        AsyncCall(sync_local_library, None, force=True)
+        AsyncCall(LibrarySyncer().sync_local_library, None, force=True)
 
     def on_local_library_syncing(self):
         self.sync_box.show_running_markup(_("<i>Syncing library...</i>"))
 
     def on_local_library_synced(self):
         self.sync_box.show_completion_markup(self.get_sync_box_label(), "")
+        AsyncCall(sync_media, None)
 
     def get_sync_box_label(self):
         synced_at = settings.read_setting("last_library_sync_at")
@@ -201,7 +203,7 @@ class AccountsBox(BaseConfigBox):
                 }
             )
             if sync_warn_dialog.result == Gtk.ResponseType.YES:
-                AsyncCall(sync_local_library, None)
+                AsyncCall(LibrarySyncer().sync_local_library, None)
             else:
                 return
 

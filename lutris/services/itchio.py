@@ -1,9 +1,10 @@
 """itch.io service"""
+
 import datetime
 import json
 import os
 from gettext import gettext as _
-from typing import List
+from typing import Any, Dict, List, Optional
 from urllib.parse import quote_plus, urlencode
 
 from lutris import settings
@@ -11,7 +12,7 @@ from lutris.database import games as games_db
 from lutris.exceptions import UnavailableGameError
 from lutris.installer import AUTO_ELF_EXE, AUTO_WIN32_EXE
 from lutris.installer.installer_file import InstallerFile
-from lutris.services.base import OnlineService
+from lutris.services.base import SERVICE_LOGIN, OnlineService
 from lutris.services.service_game import ServiceGame
 from lutris.services.service_media import ServiceMedia
 from lutris.util import linux
@@ -29,7 +30,7 @@ class ItchIoCover(ServiceMedia):
     dest_path = os.path.join(settings.CACHE_DIR, "itchio/cover")
     file_patterns = ["%s.png"]
 
-    def get_media_url(self, details):
+    def get_media_url(self, details: Dict[str, Any]) -> Optional[str]:
         """Extract cover from API"""
         # Animated (gif) covers have an extra field with a png version of the cover
         if "still_cover_url" in details:
@@ -40,7 +41,7 @@ class ItchIoCover(ServiceMedia):
                 return details["cover_url"]
         else:
             logger.warning("No field 'cover_url' in API game %s", details)
-        return
+        return None
 
 
 class ItchIoCoverMedium(ItchIoCover):
@@ -127,7 +128,7 @@ class ItchIoService(OnlineService):
 
     def login_callback(self, url):
         """Called after the user has logged in successfully"""
-        self.emit("service-login")
+        SERVICE_LOGIN.fire(self)
 
     def is_connected(self):
         """Check if service is connected and can call the API"""
@@ -612,7 +613,9 @@ class ItchIoService(OnlineService):
     def get_patch_files(self, installer, installer_file_id):
         """Similar to get_installer_files but for patches"""
         # No really, it is the same! so we just call get_installer_files
-        return self.get_installer_files(installer, installer_file_id, [])
+        # and strip off the extras files.
+        files, _extra_files = self.get_installer_files(installer, installer_file_id, [])
+        return files
 
     def get_file_weight(self, name, demo):
         if name.endswith(".rpm"):

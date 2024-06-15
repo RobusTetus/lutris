@@ -1,4 +1,5 @@
 """Main window for the Lutris interface."""
+
 # pylint: disable=too-many-lines
 # pylint: disable=no-member
 import os
@@ -10,17 +11,21 @@ from urllib.parse import unquote, urlparse
 from gi.repository import Gdk, Gio, GLib, GObject, Gtk
 
 from lutris import services, settings
-from lutris.api import LUTRIS_ACCOUNT_CONNECTED
+from lutris.api import (
+    LUTRIS_ACCOUNT_CONNECTED,
+    LUTRIS_ACCOUNT_DISCONNECTED,
+    get_runtime_versions,
+    read_user_info,
+)
 from lutris.database import categories as categories_db
 from lutris.database import games as games_db
 from lutris.database.services import ServiceGameCollection
-from lutris.exception_backstops import get_error_handler, register_error_handler
 from lutris.exceptions import EsyncLimitError
-from lutris.game import Game
+from lutris.game import GAME_INSTALLED, GAME_STOPPED, GAME_UNHANDLED_ERROR, GAME_UPDATED, Game
 from lutris.gui import dialogs
 from lutris.gui.addgameswindow import AddGamesWindow
 from lutris.gui.config.preferences_dialog import PreferencesDialog
-from lutris.gui.dialogs import ErrorDialog
+from lutris.gui.dialogs import ClientLoginDialog, ErrorDialog, QuestionDialog, get_error_handler, register_error_handler
 from lutris.gui.dialogs.delegates import DialogInstallUIDelegate, DialogLaunchUIDelegate
 from lutris.gui.dialogs.game_import import ImportGameDialog
 from lutris.gui.download_queue import DownloadQueue
@@ -32,14 +37,15 @@ from lutris.gui.widgets.gi_composites import GtkTemplate
 from lutris.gui.widgets.sidebar import LutrisSidebar
 from lutris.gui.widgets.utils import load_icon_theme, open_uri
 from lutris.runtime import ComponentUpdater, RuntimeUpdater
-from lutris.services.base import BaseService
+from lutris.search import GameSearch
+from lutris.services.base import SERVICE_GAMES_LOADED, SERVICE_LOGIN, SERVICE_LOGOUT
 from lutris.services.lutris import LutrisService
 from lutris.util import datapath
-from lutris.util.jobs import AsyncCall
-from lutris.util.library_sync import LOCAL_LIBRARY_UPDATED, sync_local_library
+from lutris.util.jobs import COMPLETED_IDLE_TASK, AsyncCall, schedule_at_idle
+from lutris.util.library_sync import LOCAL_LIBRARY_UPDATED, LibrarySyncer
 from lutris.util.log import logger
 from lutris.util.path_cache import MISSING_GAMES, add_to_path_cache
-from lutris.util.strings import get_natural_sort_key, strip_accents
+from lutris.util.strings import get_natural_sort_key
 from lutris.util.system import update_desktop_icons
 
 
@@ -52,18 +58,23 @@ class LutrisWindow(Gtk.ApplicationWindow, DialogLaunchUIDelegate, DialogInstallU
     default_height = 600
 
     __gtype_name__ = "LutrisWindow"
-    games_stack = GtkTemplate.Child()
-    sidebar_revealer = GtkTemplate.Child()
-    sidebar_scrolled = GtkTemplate.Child()
-    game_revealer = GtkTemplate.Child()
-    search_entry = GtkTemplate.Child()
-    zoom_adjustment = GtkTemplate.Child()
-    blank_overlay = GtkTemplate.Child()
-    viewtype_icon = GtkTemplate.Child()
+    games_stack: Gtk.Stack = GtkTemplate.Child()
+    sidebar_revealer: Gtk.Revealer = GtkTemplate.Child()
+    sidebar_scrolled: Gtk.ScrolledWindow = GtkTemplate.Child()
+    game_revealer: Gtk.Revealer = GtkTemplate.Child()
+    search_entry: Gtk.SearchEntry = GtkTemplate.Child()
+    zoom_adjustment: Gtk.Adjustment = GtkTemplate.Child()
+    blank_overlay: Gtk.Alignment = GtkTemplate.Child()
+    viewtype_icon: Gtk.Image = GtkTemplate.Child()
     download_revealer: Gtk.Revealer = GtkTemplate.Child()
     game_view_spinner: Gtk.Spinner = GtkTemplate.Child()
+    login_notification_revealer: Gtk.Revealer = GtkTemplate.Child()
+    lutris_log_in_label: Gtk.Label = GtkTemplate.Child()
+    turn_on_library_sync_label: Gtk.Label = GtkTemplate.Child()
+    version_notification_revealer: Gtk.Revealer = GtkTemplate.Child()
+    version_notification_label: Gtk.Revealer = GtkTemplate.Child()
 
-    def __init__(self, application, **kwargs):
+    def __init__(self, application, **kwargs) -> None:
         width = int(settings.read_setting("width") or self.default_width)
         height = int(settings.read_setting("height") or self.default_height)
         super().__init__(
@@ -84,8 +95,9 @@ class LutrisWindow(Gtk.ApplicationWindow, DialogLaunchUIDelegate, DialogInstallU
         self.window_size = (width, height)
         self.maximized = settings.read_setting("maximized") == "True"
         self.service = None
-        self.search_timer_id = None
+        self.search_timer_task = COMPLETED_IDLE_TASK
         self.filters = self.load_filters()
+        self.game_search = None
         self.set_service(self.filters.get("service"))
         self.icon_type = self.load_icon_type()
         self.game_store = GameStore(self.service, self.service_media)
@@ -135,24 +147,26 @@ class LutrisWindow(Gtk.ApplicationWindow, DialogLaunchUIDelegate, DialogInstallU
         self.game_revealer.add(self.revealer_box)
 
         self.update_action_state()
+        self.update_notification()
 
-        GObject.add_emission_hook(BaseService, "service-login", self.on_service_login)
-        GObject.add_emission_hook(BaseService, "service-logout", self.on_service_logout)
-        GObject.add_emission_hook(BaseService, "service-games-loaded", self.on_service_games_updated)
-        GObject.add_emission_hook(Game, "game-updated", self.on_game_updated)
-        GObject.add_emission_hook(Game, "game-stopped", self.on_game_stopped)
-        GObject.add_emission_hook(Game, "game-installed", self.on_game_installed)
-        GObject.add_emission_hook(Game, "game-unhandled-error", self.on_game_unhandled_error)
+        SERVICE_LOGIN.register(self.on_service_login)
+        SERVICE_LOGOUT.register(self.on_service_logout)
+        SERVICE_GAMES_LOADED.register(self.on_service_games_loaded)
+        GAME_UPDATED.register(self.on_game_updated)
+        GAME_STOPPED.register(self.on_game_stopped)
+        GAME_INSTALLED.register(self.on_game_installed)
+        GAME_UNHANDLED_ERROR.register(self.on_game_unhandled_error)
         GObject.add_emission_hook(PreferencesDialog, "settings-changed", self.on_settings_changed)
         MISSING_GAMES.updated.register(self.update_missing_games_sidebar_row)
         LUTRIS_ACCOUNT_CONNECTED.register(self.on_lutris_account_connected)
+        LUTRIS_ACCOUNT_DISCONNECTED.register(self.on_lutris_account_disconnected)
         LOCAL_LIBRARY_UPDATED.register(self.on_local_library_updated)
 
         # Finally trigger the initialization of the view here
         selected_category = settings.read_setting("selected_category", default="runner:all")
         self.sidebar.selected_category = selected_category.split(":", maxsplit=1) if selected_category else None
 
-        GLib.timeout_add(1000, self.sync_library)
+        schedule_at_idle(self.sync_library, delay_seconds=1.0)
 
     def _init_actions(self):
         Action = namedtuple("Action", ("callback", "type", "enabled", "default", "accel"))
@@ -237,10 +251,10 @@ class LutrisWindow(Gtk.ApplicationWindow, DialogLaunchUIDelegate, DialogInstallU
             if value.accel:
                 app.add_accelerator(value.accel, "win." + name)
 
-    def sync_library(self, force=False):
+    def sync_library(self, force: bool = False) -> None:
         """Tasks that can be run after the UI has been initialized."""
         if settings.read_bool_setting("library_sync_enabled"):
-            AsyncCall(sync_local_library, None, force=force)
+            AsyncCall(LibrarySyncer().sync_local_library, None, force=force)
 
     def update_action_state(self):
         """This invokes the functions to update the enabled states of all the actions
@@ -293,7 +307,7 @@ class LutrisWindow(Gtk.ApplicationWindow, DialogLaunchUIDelegate, DialogInstallU
 
     @property
     def filter_installed(self):
-        return settings.read_bool_setting("filter_installed", True)
+        return settings.read_bool_setting("filter_installed", False)
 
     @property
     def side_panel_visible(self):
@@ -411,27 +425,32 @@ class LutrisWindow(Gtk.ApplicationWindow, DialogLaunchUIDelegate, DialogInstallU
         games = self.filter_games(games)
         return sorted(games, key=lambda game: max(game["installed_at"] or 0, game["lastplayed"] or 0), reverse=True)
 
-    def filter_games(self, games):
+    def get_game_search(self):
+        """Returns a game-search object for the current view settings and search text; this object
+        is cached so that we need not re-parse the search if it has not changed."""
+        text = self.filters.get("text") or ""
+        if self.game_search is None or self.game_search.service != self.service or self.game_search.text != text:
+            self.game_search = GameSearch(text, self.service)
+        return self.game_search
+
+    def filter_games(self, games, implicit_filters: bool = True):
         """Filters a list of games according to the 'installed' and 'text' filters, if those are
         set. But if not, can just return games unchanged."""
-        installed = bool(self.filters.get("installed"))
-        text = self.filters.get("text")
-        if text:
-            text = strip_accents(text).casefold()
+        search = self.get_game_search()
 
-        def game_matches(game):
-            if installed:
-                if "appid" in game and game["appid"] not in games_db.get_service_games(self.service.id):
-                    return False
-            if not text:
-                return True
-            name = strip_accents(game["name"]).casefold()
-            return text in name
+        if implicit_filters:
+            if self.filters.get("installed") and not search.has_component("installed"):
+                search = search.with_predicate(search.get_installed_predicate(installed=True))
 
-        if installed or text:
-            return [game for game in games if game_matches(game)]
+            category = self.filters.get("category") or "all"
 
-        return games
+            if category != ".hidden" and not search.has_component("hidden"):
+                search = search.with_predicate(search.get_category_predicate(".hidden", False))
+
+        if search.is_empty:
+            return games
+
+        return [game for game in games if search.matches(game)]
 
     def set_service(self, service_name):
         if self.service and self.service.id == service_name:
@@ -479,14 +498,15 @@ class LutrisWindow(Gtk.ApplicationWindow, DialogLaunchUIDelegate, DialogInstallU
         if self.filters.get("dynamic_category") in self.dynamic_categories_game_factories:
             return self.dynamic_categories_game_factories[self.filters["dynamic_category"]]()
 
+        search = self.get_game_search()
         category = self.filters.get("category") or "all"
         included = [category] if category != "all" else None
-        excluded = [".hidden"] if category != ".hidden" else []
+        excluded = [".hidden"] if category != ".hidden" and not search.has_component("hidden") else []
         category_game_ids = categories_db.get_game_ids_for_categories(included, excluded)
 
         filters = self.get_sql_filters()
         games = games_db.get_games(filters=filters)
-        games = self.filter_games([game for game in games if game["id"] in category_game_ids])
+        games = self.filter_games([game for game in games if game["id"] in category_game_ids], implicit_filters=False)
         return self.apply_view_sort(games)
 
     def get_sql_filters(self):
@@ -496,7 +516,7 @@ class LutrisWindow(Gtk.ApplicationWindow, DialogLaunchUIDelegate, DialogInstallU
             sql_filters["runner"] = self.filters["runner"]
         if self.filters.get("platform"):
             sql_filters["platform"] = self.filters["platform"]
-        if self.filters.get("installed"):
+        if self.filters.get("installed") and not self.get_game_search().has_component("installed"):
             sql_filters["installed"] = "1"
 
         # We omit the "text" search here because SQLite does a fairly literal
@@ -564,7 +584,7 @@ class LutrisWindow(Gtk.ApplicationWindow, DialogLaunchUIDelegate, DialogInstallU
             else:
                 self.show_label(_("No games found"))
 
-    def update_store(self, *_args, **_kwargs):
+    def update_store(self) -> None:
         service_id = self.filters.get("service")
         service = self.service
         service_media = self.service_media
@@ -625,10 +645,9 @@ class LutrisWindow(Gtk.ApplicationWindow, DialogLaunchUIDelegate, DialogInstallU
             else:
                 self.show_empty_label()
 
-        self.search_timer_id = None
+            self.update_notification()
 
         AsyncCall(self.get_games_from_filters, on_games_ready)
-        return False
 
     def _bind_zoom_adjustment(self):
         """Bind the zoom slider to the supported banner sizes"""
@@ -673,7 +692,15 @@ class LutrisWindow(Gtk.ApplicationWindow, DialogLaunchUIDelegate, DialogInstallU
         splash_box = Gtk.HBox(visible=True, margin_top=24)
         splash_box.pack_start(side_splash, False, False, 12)
         splash_box.set_center_widget(center_splash)
+        splash_box.is_splash = True
         self.show_overlay(splash_box, Gtk.Align.FILL, Gtk.Align.FILL)
+
+    def is_showing_splash(self):
+        if self.blank_overlay.get_visible():
+            for ch in self.blank_overlay.get_children():
+                if hasattr(ch, "is_splash"):
+                    return True
+        return False
 
     def show_spinner(self):
         # This is inconsistent, but we can't use the blank overlay for the spinner- it
@@ -819,7 +846,50 @@ class LutrisWindow(Gtk.ApplicationWindow, DialogLaunchUIDelegate, DialogInstallU
         settings.write_setting("filter_installed", bool(filter_installed))
         self.filters["installed"] = filter_installed
 
-    def on_service_games_updated(self, service):
+    def update_notification(self):
+        show_notification = self.is_showing_splash()
+        if show_notification:
+            if not read_user_info():
+                self.lutris_log_in_label.show()
+                self.turn_on_library_sync_label.hide()
+            elif not settings.read_bool_setting("library_sync_enabled"):
+                self.lutris_log_in_label.hide()
+                self.turn_on_library_sync_label.show()
+            else:
+                show_notification = False
+
+        self.login_notification_revealer.set_reveal_child(show_notification)
+
+    @GtkTemplate.Callback
+    def on_lutris_log_in_label_activate_link(self, _label, _url):
+        ClientLoginDialog(parent=self)
+
+    @GtkTemplate.Callback
+    def on_turn_on_library_sync_label_activate_link(self, _label, _url):
+        settings.write_setting("library_sync_enabled", True)
+        self.sync_library(force=True)
+        self.update_notification()
+
+    def on_version_notification_close_button_clicked(self, _button):
+        dialog = QuestionDialog(
+            {
+                "title": _("Unsupported Lutris Version"),
+                "question": _(
+                    "This version of Lutris will no longer receive support on Github and Discord, "
+                    "and may not interoperate properly with Lutris.net. Do you want to use it anyway?"
+                ),
+                "parent": self,
+            }
+        )
+
+        if dialog.result == Gtk.ResponseType.YES:
+            self.version_notification_revealer.set_reveal_child(False)
+            runtime_versions = get_runtime_versions()
+            if runtime_versions:
+                client_version = runtime_versions.get("client_version")
+                settings.write_setting("ignored_supported_lutris_verison", client_version or "")
+
+    def on_service_games_loaded(self, service):
         """Request a view update when service games are loaded"""
         if self.service and service.id == self.service.id:
             self.update_store()
@@ -844,20 +914,26 @@ class LutrisWindow(Gtk.ApplicationWindow, DialogLaunchUIDelegate, DialogInstallU
             self.move(int(self.window_x), int(self.window_y))
 
     def on_service_login(self, service):
+        self.update_notification()
         service.start_reload(self._service_reloaded_cb)
         return True
 
     def _service_reloaded_cb(self, error):
         if error:
-            dialogs.ErrorDialog(error, parent=self)
+            dialogs.display_error(error, parent=self)
 
     def on_service_logout(self, service):
+        self.update_notification()
         if self.service and service.id == self.service.id:
             self.update_store()
         return True
 
     def on_lutris_account_connected(self):
+        self.update_notification()
         self.sync_library(force=True)
+
+    def on_lutris_account_disconnected(self):
+        self.update_notification()
 
     def on_local_library_updated(self):
         self.redraw_view()
@@ -921,10 +997,9 @@ class LutrisWindow(Gtk.ApplicationWindow, DialogLaunchUIDelegate, DialogInstallU
     @GtkTemplate.Callback
     def on_search_entry_changed(self, entry):
         """Callback for the search input keypresses"""
-        if self.search_timer_id:
-            GLib.source_remove(self.search_timer_id)
-        self.filters["text"] = entry.get_text().lower().strip()
-        self.search_timer_id = GLib.timeout_add(500, self.update_store)
+        self.search_timer_task.unschedule()
+        self.filters["text"] = entry.get_text().strip()
+        self.search_timer_task = schedule_at_idle(self.update_store, delay_seconds=0.5)
 
     @GtkTemplate.Callback
     def on_search_entry_key_press(self, widget, event):
@@ -944,12 +1019,11 @@ class LutrisWindow(Gtk.ApplicationWindow, DialogLaunchUIDelegate, DialogInstallU
         """Open the about dialog."""
         dialogs.AboutDialog(parent=self)
 
-    def on_game_unhandled_error(self, _game: Game, error: BaseException) -> bool:
+    def on_game_unhandled_error(self, _game: Game, error: BaseException) -> None:
         """Called when a game has sent the 'game-error' signal"""
 
         error_handler = get_error_handler(type(error))
         error_handler(error, self)
-        return True
 
     @GtkTemplate.Callback
     def on_add_game_button_clicked(self, *_args):
@@ -1047,6 +1121,7 @@ class LutrisWindow(Gtk.ApplicationWindow, DialogLaunchUIDelegate, DialogInstallU
             self.rebuild_view("grid")
         else:
             self.update_view_settings()
+        self.update_notification()
         return True
 
     def is_game_displayed(self, game):
@@ -1060,9 +1135,14 @@ class LutrisWindow(Gtk.ApplicationWindow, DialogLaunchUIDelegate, DialogInstallU
 
             # If the update took the row out of this view's category, we'll need
             # to update the view to reflect that.
-            if row.type in ("category", "user_category"):
+            search = self.get_game_search()
+            enforce_hidden = not search.has_component("hidden")
+            if row.type == "dynamic_category" and row.id == "recent":
+                if enforce_hidden and ".hidden" in game.get_categories():
+                    return False
+            elif row.type in ("category", "user_category"):
                 categories = game.get_categories()
-                if row.id != ".hidden" and ".hidden" in categories:
+                if enforce_hidden and row.id != ".hidden" and ".hidden" in categories:
                     return False
 
                 if row.id != "all" and row.id not in categories:
@@ -1091,18 +1171,16 @@ class LutrisWindow(Gtk.ApplicationWindow, DialogLaunchUIDelegate, DialogInstallU
 
         return True
 
-    def on_game_stopped(self, game):
+    def on_game_stopped(self, game: Game) -> None:
         """Updates the game list when a game stops; this keeps the 'running' page updated."""
         selected_row = self.sidebar.get_selected_row()
         # Only update the running page- we lose the selected row when we do this,
         # but on the running page this is okay.
         if selected_row is not None and selected_row.id == "running":
             self.game_store.remove_game(game.id)
-        return True
 
     def on_game_installed(self, game):
         self.sync_library()
-        return True
 
     def on_game_removed(self):
         """Simple method used to refresh the view"""
@@ -1147,7 +1225,8 @@ class LutrisWindow(Gtk.ApplicationWindow, DialogLaunchUIDelegate, DialogInstallU
             which can easily block."""
             runtime_updater = RuntimeUpdater(force=force_updates)
             component_updaters = runtime_updater.create_component_updaters()
-            return component_updaters, runtime_updater
+            supported_client_version = runtime_updater.check_client_versions()
+            return component_updaters, runtime_updater, supported_client_version
 
         def create_runtime_updater_cb(result, error):
             """Picks up the component updates when we know what they are, and begins the installation.
@@ -1156,7 +1235,14 @@ class LutrisWindow(Gtk.ApplicationWindow, DialogLaunchUIDelegate, DialogInstallU
             if error:
                 logger.exception("Failed to obtain updates from Lutris.net: %s", error)
             else:
-                component_updaters, runtime_updater = result
+                component_updaters, runtime_updater, supported_client_version = result
+
+                if supported_client_version:
+                    markup = self.version_notification_label.get_label()
+                    markup = markup % (settings.VERSION, supported_client_version)
+                    self.version_notification_label.set_label(markup)
+                    self.version_notification_revealer.set_reveal_child(True)
+
                 if component_updaters:
                     self.install_runtime_component_updates(component_updaters, runtime_updater)
                 else:

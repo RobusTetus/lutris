@@ -39,3 +39,19 @@
   color: @theme_text_color;
   background-color: @theme_base_color;
 }
+
+.in-app-notification {
+    padding: 5px;
+    border-radius: 0
+}
+
+.in-app-notification label link {
+    color: unset;
+}
+
+.in-app-notification button {
+	padding: 0px;
+	min-height: 0px;
+	min-width: 0px;
+	border-radius: 0px;
+}

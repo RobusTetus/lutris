@@ -157,6 +157,21 @@ class GameActions:
         dlg = application.show_window(UninstallDialog, parent=self.window)
         dlg.add_games(game_ids)
 
+    def on_edit_game_categories(self, _widget):
+        """Edit game categories"""
+        games = self.get_games()
+        if len(games) == 1:
+            # Individual games get individual separate windows
+            self.application.show_window(EditGameCategoriesDialog, game=games[0], parent=self.window)
+        else:
+
+            def add_games(window):
+                window.add_games(self.get_games())
+
+            # Multi-select means a common categories window for all of them; we can wind
+            # up adding games to it if it's already open
+            self.application.show_window(EditGameCategoriesDialog, update_function=add_games, parent=self.window)
+
 
 class MultiGameActions(GameActions):
     """This actions class handles actions on multiple games together, and only iof they
@@ -174,6 +189,7 @@ class MultiGameActions(GameActions):
         return [
             ("stop", _("Stop"), self.on_game_stop),
             (None, "-", None),
+            ("category", _("Categories"), self.on_edit_game_categories),
             ("favorite", _("Add to favorites"), self.on_add_favorite_game),
             ("deletefavorite", _("Remove from favorites"), self.on_delete_favorite_game),
             ("hide", _("Hide game from library"), self.on_hide_game),
@@ -185,6 +201,7 @@ class MultiGameActions(GameActions):
     def get_displayed_entries(self):
         return {
             "stop": self.is_game_running,
+            "category": True,
             "favorite": any(g for g in self.games if not g.is_favorite),
             "deletefavorite": any(g for g in self.games if g.is_favorite),
             "hide": any(g for g in self.games if g.is_installed and not g.is_hidden),
@@ -309,10 +326,6 @@ class SingleGameActions(GameActions):
         """Edit game preferences"""
         self.application.show_window(EditGameConfigDialog, game=self.game, parent=self.window)
 
-    def on_edit_game_categories(self, _widget):
-        """Edit game categories"""
-        self.application.show_window(EditGameCategoriesDialog, game=self.game, parent=self.window)
-
     def on_browse_files(self, _widget):
         """Callback to open a game folder in the file browser"""
         path = self.game.get_browse_dir()
@@ -391,6 +404,8 @@ class SingleGameActions(GameActions):
             new_config_id = duplicate_game_config(game.slug, old_config_id)
         else:
             new_config_id = None
+        categories = game.get_categories()
+
         duplicate_game_dialog.destroy()
         db_game = get_game_by_field(game.id, "id")
         db_game["name"] = new_name
@@ -404,7 +419,14 @@ class SingleGameActions(GameActions):
         db_game.pop("service_id", None)
 
         game_id = add_game(**db_game)
+
         new_game = Game(game_id)
+
+        # add categories before the save, so it can emit the signal. add_game()
+        # means the game is already on the database, so this is legit.
+        for cat in categories:
+            new_game.add_category(cat, no_signal=True)
+
         new_game.save()
 
         # Download in the background; we'll update the LutrisWindow when this

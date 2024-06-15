@@ -1,8 +1,9 @@
 """Utility module to deal with Proton and umu"""
+
 import json
 import os
 from gettext import gettext as _
-from typing import Generator, List
+from typing import Generator, List, Optional
 
 from lutris import settings
 from lutris.util import system
@@ -12,11 +13,11 @@ GE_PROTON_LATEST = _("GE-Proton (Latest)")
 DEFAULT_GAMEID = "umu-default"
 
 
-def is_proton_path(wine_path):
+def is_proton_path(wine_path) -> bool:
     return "Proton" in wine_path and "lutris" not in wine_path
 
 
-def get_umu_path():
+def get_umu_path() -> Optional[str]:
     custom_path = settings.read_setting("umu_path")
     if custom_path:
         script_path = os.path.join(custom_path, "umu_run.py")
@@ -35,6 +36,7 @@ def get_umu_path():
         script_path = os.path.join(path_candidate, "umu", "umu_run.py")
         if system.path_exists(script_path):
             return script_path
+    return None
 
 
 def _iter_proton_locations() -> Generator[str, None, None]:
@@ -81,7 +83,7 @@ def list_proton_versions() -> List[str]:
     return versions
 
 
-def get_proton_bin_for_version(version):
+def get_proton_bin_for_version(version) -> str:
     for proton_path in get_proton_paths():
         path = os.path.join(proton_path, version, "dist/bin/wine")
         if os.path.isfile(path):
@@ -89,6 +91,7 @@ def get_proton_bin_for_version(version):
         path = os.path.join(proton_path, version, "files/bin/wine")
         if os.path.isfile(path):
             return path
+    return ""
 
 
 def get_proton_path_from_bin(wine_path):
@@ -96,12 +99,23 @@ def get_proton_path_from_bin(wine_path):
     return os.path.abspath(os.path.join(os.path.dirname(wine_path), "../../"))
 
 
-def get_game_id(game):
+def get_game_id(game) -> str:
+    if not game:
+        return DEFAULT_GAMEID
+
+    envs = game.runner.get_env()
+    game_id = envs.get("GAMEID") or envs.get("UMU_ID")
+    if game_id:
+        return game_id
+
     games_path = os.path.join(settings.RUNTIME_DIR, "umu-games/umu-games.json")
+
     if not os.path.exists(games_path):
         return DEFAULT_GAMEID
+
     with open(games_path, "r", encoding="utf-8") as games_file:
         umu_games = json.load(games_file)
+
     for umu_game in umu_games:
         if (
             umu_game["store"]
